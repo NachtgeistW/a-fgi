@@ -1,11 +1,9 @@
 name: Daily Fetch
 
 on:
-  workflow_dispatch:  # 手动触发
+  workflow_dispatch:
   schedule:
-    # UTC 02:00 / 04:00 / 08:00 = CST 10:00 / 12:00 / 16:00
-    # 周一到周五
-    - cron: '0 2,4,8 * * 1-5'
+    - cron: '0 2,4,10 * * 1-5'
 
 jobs:
   fetch:
