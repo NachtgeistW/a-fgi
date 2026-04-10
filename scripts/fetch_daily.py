@@ -1,10 +1,18 @@
 """
-A股恐惧与贪婪指数 - Phase 1: 当日数据采集验证脚本 (v4)
+A股恐惧与贪婪指数 - Phase 1: 当日数据采集验证脚本 (v5)
 
-新增:
-1. NO_PROXY 环境变量,绕过本地代理直连数据源
-2. 全局 requests.get monkey patch: Connection: close + 随机 UA + 超时
-3. 东财接口 3 秒节流
+数据源策略:
+- 中证系列指数 (A500, 中证全指) 走中证官方源 stock_zh_index_hist_csindex
+- 全市场快照走东财 stock_zh_a_spot_em
+- 涨跌停池走东财 stock_zt_pool_em / stock_zt_pool_dtgc_em
+- 两融走沪深交易所官方源
+- QVIX 走 akshare 打包的 optbbs 源
+- 国债 ETF 走新浪 fund_etf_hist_sina
+
+增强:
+- NO_PROXY 环境变量 (本地调试用,云端无影响)
+- requests.get 全局 patch: trust_env=False + 随机 UA + Connection: close
+- 东财接口 3 秒节流
 """
 
 import os
@@ -24,8 +32,6 @@ import requests
 import random
 import time
 from datetime import datetime, timedelta
-from functools import partial
-from unittest.mock import patch
 
 
 # ============================================================
@@ -49,9 +55,9 @@ _original_get = requests.get
 def enhanced_get(url, **kwargs):
     """
     增强版 requests.get:
-    - 不继承系统环境代理 (trust_env=False)
+    - 不继承系统环境代理
     - 随机 UA
-    - Connection: close 避免长连接被东财切断
+    - Connection: close 避免长连接被切断
     - 默认 15 秒超时
     """
     session = requests.Session()
@@ -68,7 +74,6 @@ def enhanced_get(url, **kwargs):
         session.close()
 
 
-# 全局 patch: akshare 内部所有 requests.get 都走 enhanced_get
 requests.get = enhanced_get
 
 
@@ -120,6 +125,7 @@ def try_sources(sources, label):
 
 
 def filter_universe(df, name_col='名称'):
+    """剔除 ST/*ST/退市整理期股票"""
     if name_col not in df.columns:
         return df
     mask = (
@@ -131,6 +137,7 @@ def filter_universe(df, name_col='名称'):
 
 
 def get_col(df, candidates):
+    """从候选列名里找第一个存在的"""
     for c in candidates:
         if c in df.columns:
             return c
@@ -138,6 +145,7 @@ def get_col(df, candidates):
 
 
 def clean_ohlc(df, close_candidates=('close', '收盘')):
+    """清洗 OHLC 数据: 剔除 close 为 NaN 的行,强制数值类型"""
     if df is None or len(df) == 0:
         return df
     close_col = get_col(df, close_candidates)
@@ -149,6 +157,13 @@ def clean_ohlc(df, close_candidates=('close', '收盘')):
     return df
 
 
+def date_range_str():
+    """返回 (2 年前的日期, 今天) 的 YYYYMMDD 格式元组"""
+    end = datetime.now().strftime('%Y%m%d')
+    start = (datetime.now() - timedelta(days=730)).strftime('%Y%m%d')
+    return start, end
+
+
 # ============================================================
 # 指标 1: 市场动量
 # ============================================================
@@ -156,24 +171,20 @@ def clean_ohlc(df, close_candidates=('close', '收盘')):
 def fetch_indicator_1():
     section("指标 1: 市场动量 (A500 + 中证全指)")
 
-    a500_sources = [
-        ("新浪 stock_zh_index_daily", lambda: ak.stock_zh_index_daily(symbol="sh000510")),
-        ("东财 stock_zh_index_daily_em", lambda: ak.stock_zh_index_daily_em(symbol="sh000510")),
-        ("东财 index_zh_a_hist", lambda: ak.index_zh_a_hist(
-            symbol="000510", period="daily", start_date="20200101",
-            end_date=datetime.now().strftime('%Y%m%d'))),
-    ]
-    a500, _ = try_sources(a500_sources, "A500")
+    start, end = date_range_str()
+
+    a500, _ = try_sources([
+        ("中证官方 stock_zh_index_hist_csindex",
+         lambda: ak.stock_zh_index_hist_csindex(
+             symbol="000510", start_date=start, end_date=end)),
+    ], "A500")
     a500 = clean_ohlc(a500)
 
-    allshare_sources = [
-        ("东财 index_zh_a_hist", lambda: ak.index_zh_a_hist(
-            symbol="000985", period="daily", start_date="20200101",
-            end_date=datetime.now().strftime('%Y%m%d'))),
-        ("东财 stock_zh_index_daily_em", lambda: ak.stock_zh_index_daily_em(symbol="sh000985")),
-        ("新浪 stock_zh_index_daily", lambda: ak.stock_zh_index_daily(symbol="sh000985")),
-    ]
-    allshare, _ = try_sources(allshare_sources, "中证全指")
+    allshare, _ = try_sources([
+        ("中证官方 stock_zh_index_hist_csindex",
+         lambda: ak.stock_zh_index_hist_csindex(
+             symbol="000985", start_date=start, end_date=end)),
+    ], "中证全指")
     allshare = clean_ohlc(allshare)
 
     def compute_dev(df, label):
@@ -207,26 +218,18 @@ def fetch_indicator_1():
 def fetch_snapshot_indicators():
     section("全市场快照 (指标 2 / 3 / 8 依赖)")
 
-    sources = [
+    df, source_name = try_sources([
         ("东财 stock_zh_a_spot_em", lambda: ak.stock_zh_a_spot_em()),
-        ("新浪 stock_zh_a_spot", lambda: ak.stock_zh_a_spot()),
-    ]
-    df, source_name = try_sources(sources, "全市场快照")
+    ], "全市场快照")
     if df is None:
         return
 
-    col_map = {
-        'name': '名称', 'changepercent': '涨跌幅',
-        'amount': '成交额', 'turnoverratio': '换手率',
-        'trade': '最新价'
-    }
-    df = df.rename(columns=col_map)
     print(f"  可用字段: {[c for c in ['名称','涨跌幅','成交额','换手率'] if c in df.columns]}")
 
     df_f = filter_universe(df, name_col='名称')
     ok(f"剔除 ST/退市后: {len(df_f)} 只 (-{len(df) - len(df_f)})")
 
-    # 指标 3
+    # 指标 3: 资金广度
     section("指标 3: 资金广度 (成交额加权涨跌)")
     if '涨跌幅' in df_f.columns and '成交额' in df_f.columns:
         df_f['涨跌幅'] = pd.to_numeric(df_f['涨跌幅'], errors='coerce')
@@ -243,7 +246,7 @@ def fetch_snapshot_indicators():
     else:
         err(f"字段缺失: {list(df_f.columns)}")
 
-    # 指标 8
+    # 指标 8: 换手率
     section("指标 8: 市场热度 (等权换手率)")
     if '换手率' in df_f.columns:
         df_f['换手率'] = pd.to_numeric(df_f['换手率'], errors='coerce')
@@ -252,9 +255,9 @@ def fetch_snapshot_indicators():
         ok(f"当日等权平均换手率: {t.mean():.3f}%, 参与 {len(t)} 只")
         warn("5日/250日比值需历史数据")
     else:
-        err("字段缺少 '换手率' (新浪源不含此字段,需东财源)")
+        err("字段缺少 '换手率'")
 
-    # 指标 2
+    # 指标 2: 价格强度
     section("指标 2: 价格强度 (52 周新高/新低)")
     warn("快照不含 52 周高低字段,需 Phase 2 历史数据库")
 
@@ -272,7 +275,7 @@ def fetch_indicator_4():
     def fetch_with_fallback(fn, label):
         for date, tag in [(today, "今日"), (yesterday, "昨日")]:
             try:
-                throttle_em()  # 东财接口节流
+                throttle_em()
                 r = fn(date=date)
                 ok(f"{tag}{label}: {len(r)} 只")
                 return r
@@ -365,11 +368,13 @@ def fetch_indicator_6():
 def fetch_indicator_7():
     section("指标 7: 避险需求 (A500 vs 10年国债ETF)")
 
-    a500_sources = [
-        ("新浪", lambda: ak.stock_zh_index_daily(symbol="sh000510")),
-        ("东财", lambda: ak.stock_zh_index_daily_em(symbol="sh000510")),
-    ]
-    a500, _ = try_sources(a500_sources, "A500")
+    start, end = date_range_str()
+
+    a500, _ = try_sources([
+        ("中证官方 stock_zh_index_hist_csindex",
+         lambda: ak.stock_zh_index_hist_csindex(
+             symbol="000510", start_date=start, end_date=end)),
+    ], "A500")
     a500 = clean_ohlc(a500)
 
     r_a500 = None
@@ -379,14 +384,10 @@ def fetch_indicator_7():
             r_a500 = (a500[cc].iloc[-1] - a500[cc].iloc[-21]) / a500[cc].iloc[-21]
             ok(f"A500 20 日收益: {r_a500 * 100:.2f}%")
 
-    bond_sources = [
-        ("东财 fund_etf_hist_em", lambda: ak.fund_etf_hist_em(
-            symbol="511260", period="daily", start_date="20250101",
-            end_date=datetime.now().strftime('%Y%m%d'), adjust="qfq")),
-        ("新浪 fund_etf_hist_sina", lambda: ak.fund_etf_hist_sina(symbol="sh511260")),
-        ("指数接口", lambda: ak.stock_zh_index_daily(symbol="sh511260")),
-    ]
-    bond, _ = try_sources(bond_sources, "10Y 国债 ETF")
+    bond, _ = try_sources([
+        ("新浪 fund_etf_hist_sina",
+         lambda: ak.fund_etf_hist_sina(symbol="sh511260")),
+    ], "10Y 国债 ETF")
     bond = clean_ohlc(bond)
 
     if bond is not None:
@@ -407,7 +408,7 @@ def fetch_indicator_7():
 
 def main():
     print(f"\n{'#' * 60}")
-    print(f"#  A股恐惧与贪婪指数 - Phase 1 数据采集验证 (v4)")
+    print(f"#  A股恐惧与贪婪指数 - Phase 1 数据采集验证 (v5)")
     print(f"#  运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"#  akshare 版本: {ak.__version__}")
     print(f"#  NO_PROXY 已启用, 东财节流 {_EM_MIN_INTERVAL}s")
